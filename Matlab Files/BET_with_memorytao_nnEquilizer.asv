@@ -1,0 +1,159 @@
+clc; clear; close all;
+
+%% ================= TARGET ===========================
+minErrors = 200;
+maxBits   = 1e9;
+
+%% ================= SYSTEM ===========================
+Rb = 10e9;
+Ns = 32;
+Fs = Rb*Ns;
+
+PRBS_order = 11;
+Nblock = 2^PRBS_order - 1;
+
+%% ================= TX FILTER ========================
+rollOff = 0.3;
+span = 10;
+hRC = rcosdesign(rollOff,span,Ns,'normal');
+
+%% ================= LASER ============================
+LASER.linewidth = 3e6;      % slightly stronger phase noise
+LASER.RIN_dB = -150;
+LASER.phase0    = 0;
+
+%% ================= PHOTODIODE ======================
+PD.R  = 0.9;
+PD.BW = 0.30*Rb;
+PD.RL = 5e4;
+PD.T  = 300;
+
+%% ================= RX LPF ==========================
+BW_rx = 0.6*Rb;
+[b,a] = butter(4,BW_rx/(Fs/2));
+
+%% ================= OPERATING POINT =================
+P_dBm = -5;
+P0 = db2pow(P_dBm-30);
+fprintf('\nOperating point = %.7f dBm\n',P_dBm);
+
+%% ================= TRAIN / TEST ====================
+Ntrain = 2^15;
+Ntest  = 2^15;
+
+[data,~] = PRBS_generator(1,PRBS_order,1);
+txBits = repmat(data(1,:),1,ceil((Ntrain+Ntest)/length(data)));
+txBits = txBits(1:Ntrain+Ntest);
+
+%% ================= TRANSMITTER ======================
+I_tx = conv(repelem(txBits,Ns),hRC,'full');
+I_tx = max(I_tx,0);
+I_tx = I_tx/max(I_tx);
+
+N = length(I_tx);
+dt = 1/Fs;
+
+%% ================= PHASE NOISE =====================
+phi = cumsum(sqrt(2*pi*LASER.linewidth*dt).*randn(1,N));
+Etx = sqrt(P0*I_tx).*exp(1j*phi);
+
+%% ================= OPTICAL NOISE ===================
+OSNR_dB = 24;   % realistic but measurable
+Ps = mean(abs(Etx).^2);
+Pn = Ps / (10^(OSNR_dB/10));
+Erx = Etx + sqrt(Pn/2)*(randn(1,N)+1j*randn(1,N));
+
+%% ================= PHOTODETECTION ==================
+[io,~] = photodiode_PD(Erx,Fs,PD);
+v = filtfilt(b,a,io*PD.RL);
+
+%% ================= SAMPLING ========================
+gd = (length(hRC)-1)/2;
+startIdx = gd + round(Ns/2);
+rx = v(startIdx:Ns:startIdx+(Ntrain+Ntest-1)*Ns);
+
+rx_train = rx(1:Ntrain);
+rx_test  = rx(Ntrain+1:end);
+
+tx_train = txBits(1:Ntrain);
+tx_test  = txBits(Ntrain+1:end);
+
+%% ================= BER BEFORE NN ===================
+err = 0; bits = 0; k = 1;
+
+while (err < minErrors) && (bits < maxBits) && ((k+Nblock-1) <= Ntest)
+
+    rxb = rx_test(k:k+Nblock-1);
+    txb = tx_test(k:k+Nblock-1);
+
+    thr = (mean(rxb(txb==1)) + mean(rxb(txb==0))) / 2;
+    rxBits = rxb > thr;
+
+    err = err + sum(rxBits ~= txb);
+    bits = bits + Nblock;
+    k = k + Nblock;
+end
+
+BER_before = err / bits;
+fprintf('BER before NN = %.3e\n', BER_before);
+
+%% ================= NN EQUALIZER ====================
+Ntaps = 9;
+delay = floor(Ntaps/2);
+
+Xtr = zeros(Ntrain,Ntaps);
+for n = 1:Ntrain
+    idx = max(1,n-delay):min(Ntrain,n+delay);
+    Xtr(n,delay+1-(n-idx(1)):delay+1+(idx(end)-n)) = rx_train(idx);
+end
+
+% Normalize (CRITICAL)
+mu = mean(Xtr(:));
+sg = std(Xtr(:));
+Xtr = (Xtr - mu)/sg;
+
+Ytr = tx_train;
+
+net = fitnet([32 16],'trainscg');
+net.performFcn = 'mse';
+net.trainParam.epochs = 300;
+net.trainParam.showWindow = false;
+
+net.divideParam.trainRatio = 0.8;
+net.divideParam.valRatio   = 0.2;
+net.divideParam.testRatio  = 0;
+
+net = train(net, Xtr', Ytr);
+
+%% ================= TEST NN =========================
+Xte = zeros(Ntest,Ntaps);
+for n = 1:Ntest
+    idx = max(1,n-delay):min(Ntest,n+delay);
+    Xte(n,delay+1-(n-idx(1)):delay+1+(idx(end)-n)) = rx_test(idx);
+end
+Xte = (Xte - mu)/sg;
+
+rxBits_nn = net(Xte') > 0.5;
+
+%% ================= BER AFTER NN ====================
+err = 0; bits = 0; k = 1;
+
+while (err < minErrors) && (bits < maxBits) && ((k+Nblock-1) <= Ntest)
+
+    rxBlock = rxBits_nn(k:k+Nblock-1);
+    txBlock = tx_test(k:k+Nblock-1);
+
+    err = err + sum(rxBlock ~= txBlock);
+    bits = bits + Nblock;
+    k = k + Nblock;
+end
+
+BER_after = err / bits;
+fprintf('BER after NN  = %.3e\n', BER_after);
+
+fprintf('Improvement  = %.2fx\n', BER_before / BER_after);
+
+%% ================= EYE DIAGRAM =====================
+figure('Color','w');
+eyediagram(v(1:8000)/max(abs(v)),2*Ns,Ns);
+title('OOK Eye: Optical Noise + Phase Noise');
